@@ -27,6 +27,7 @@ readonly DESKTOP_CONFIG="${DROIDSPACES_DESKTOP_CONFIG:-/etc/droidspaces-desktop.
 WORK_DIR=""
 PREPARED_WORK_DIR="${ANLAND_KDE_WORK_DIR:-}"
 PREPARED_PACKAGE_DIR="${ANLAND_KDE_PACKAGE_DIR:-}"
+PREPARED_ARCHIVE_NAME="${ANLAND_KDE_ARCHIVE_NAME:-}"
 UI_LANG="en"
 TARGET=""
 PACKAGE_TYPE=""
@@ -41,6 +42,7 @@ EXPECTED_MANIFEST_SHA256=""
 EXPECTED_ARCHIVE_SHA256=""
 OFFICIAL_RELEASE_METADATA=""
 UNINSTALL=false
+KDE_XWAYLAND_PRESERVED=false
 
 detect_language() {
     local locale_name="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
@@ -205,37 +207,57 @@ uninstall_kde_deb() {
 }
 
 uninstall_kde_rpm() {
-    local dnf_conf="/etc/dnf/dnf.conf" backup stripped
+    local dnf_conf="/etc/dnf/dnf.conf" backup stripped transaction
+    local -a packages=()
     command -v dnf >/dev/null 2>&1 || die "未找到 dnf。" "dnf was not found."
+    command -v rpm >/dev/null 2>&1 || die "未找到 rpm。" "rpm was not found."
     [[ -f "$dnf_conf" ]] || die "找不到 DNF 配置。" "The DNF configuration was not found."
+    mapfile -t packages < <(rpm -qa --queryformat '%{NAME}\n' |
+        awk '/^kwin([a-zA-Z0-9+._-]*)$/ || /^xorg-x11-server-Xwayland([a-zA-Z0-9+._-]*)$/' | sort -u)
+    ((${#packages[@]})) || {
+        rm -f -- "$COMPONENT_STATE_DIR/kde.version"
+        return 0
+    }
     backup="$(mktemp -t anland-kde-uninstall.XXXXXXXX)"
     stripped="$(mktemp -t anland-kde-uninstall.XXXXXXXX)"
+    transaction="$(mktemp -t anland-kde-uninstall.XXXXXXXX)"
     cp -p -- "$dnf_conf" "$backup"
     if ! rewrite_dnf_config_without_managed_block "$dnf_conf" "$stripped" || \
-        ! install -m 0644 "$stripped" "$dnf_conf" || \
-        ! dnf distro-sync -y --exclude='mesa*' --exclude='systemd*' \
-            'kwin*' 'xorg-x11-server-Xwayland*'; then
+        ! rewrite_dnf_config_for_package_install "$stripped" "$transaction" || \
+        ! install -m 0644 "$transaction" "$dnf_conf" || \
+        ! dnf distro-sync -y --exclude='mesa*' --exclude='systemd*' "${packages[@]}" || \
+        ! dnf reinstall -y --exclude='mesa*' --exclude='systemd*' "${packages[@]}"; then
         install -m 0644 "$backup" "$dnf_conf" || true
-        rm -f -- "$backup" "$stripped"
+        rm -f -- "$backup" "$stripped" "$transaction"
         die "恢复发行版 KWin/Xwayland 失败。" "Failed to restore distribution KWin/Xwayland packages."
     fi
-    rm -f -- "$backup" "$stripped" "$COMPONENT_STATE_DIR/kde.version"
+    rm -f -- "$backup" "$stripped" "$transaction" "$COMPONENT_STATE_DIR/kde.version"
 }
 
 uninstall_kde_arch() {
-    local backup stripped
+    local backup stripped niri_managed=false
+    local -a restore_packages=(kwin)
     command -v pacman >/dev/null 2>&1 || die "未找到 pacman。" "pacman was not found."
     [[ -f /etc/pacman.conf ]] || die "找不到 pacman.conf。" "pacman.conf was not found."
+    [[ -s "$COMPONENT_STATE_DIR/niri.version" ]] && niri_managed=true
+    if [[ "$niri_managed" == true ]]; then
+        KDE_XWAYLAND_PRESERVED=true
+        log "检测到 Anland Niri，将保留共用的 patched xorg-xwayland。" \
+            "Anland Niri is installed; preserving the shared patched xorg-xwayland."
+    else
+        restore_packages+=(xorg-xwayland)
+    fi
     backup="$(mktemp -t anland-kde-uninstall.XXXXXXXX)"
     stripped="$(mktemp -t anland-kde-uninstall.XXXXXXXX)"
     cp -p -- /etc/pacman.conf "$backup"
-    awk '
+    awk -v keep_xwayland="$niri_managed" '
         /^[[:space:]]*IgnorePkg[[:space:]]*=/ {
             equals = index($0, "=")
             count = split(substr($0, equals + 1), items, /[[:space:]]+/)
             output = ""
             for (i = 1; i <= count; i++) {
-                if (items[i] != "" && items[i] != "kwin" && items[i] != "xorg-xwayland") {
+                if (items[i] != "" && items[i] != "kwin" &&
+                    (items[i] != "xorg-xwayland" || keep_xwayland == "true")) {
                     output = output (output == "" ? "" : " ") items[i]
                 }
             }
@@ -245,7 +267,7 @@ uninstall_kde_arch() {
         { print }
     ' /etc/pacman.conf > "$stripped"
     if ! install -m 0644 "$stripped" /etc/pacman.conf || \
-        ! pacman -S --noconfirm kwin xorg-xwayland; then
+        ! pacman -S --noconfirm "${restore_packages[@]}"; then
         install -m 0644 "$backup" /etc/pacman.conf || true
         rm -f -- "$backup" "$stripped"
         die "恢复发行版 KWin/Xwayland 失败。" "Failed to restore distribution KWin/Xwayland packages."
@@ -259,8 +281,13 @@ uninstall_kde() {
         rpm) uninstall_kde_rpm ;;
         pkg.tar.*) uninstall_kde_arch ;;
     esac
-    log "Anland KDE 已卸载，发行版 KWin/Xwayland 已恢复。" \
-        "Anland KDE was uninstalled and distribution KWin/Xwayland packages were restored."
+    if [[ "$KDE_XWAYLAND_PRESERVED" == true ]]; then
+        log "Anland KDE 已卸载，发行版 KWin 已恢复，共用的 patched Xwayland 仍由 Anland Niri 管理。" \
+            "Anland KDE was uninstalled and distribution KWin was restored; the shared patched Xwayland remains managed by Anland Niri."
+    else
+        log "Anland KDE 已卸载，发行版 KWin/Xwayland 已恢复。" \
+            "Anland KDE was uninstalled and distribution KWin/Xwayland packages were restored."
+    fi
 }
 
 cleanup() {
@@ -285,6 +312,7 @@ require_root() {
         "ANLAND_KDE_RELEASE_TAG=$RELEASE_TAG" \
         "ANLAND_KDE_WORK_DIR=$WORK_DIR" \
         "ANLAND_KDE_PACKAGE_DIR=$PACKAGE_DIR" \
+        "ANLAND_KDE_ARCHIVE_NAME=$ARCHIVE_NAME" \
         "DROIDSPACES_DESKTOP_CONFIG=$DESKTOP_CONFIG" \
         bash "$script_path" "$@"; then
         status=0
@@ -875,6 +903,10 @@ use_prepared_packages() {
 
     WORK_DIR="$prepared_work_dir"
     PACKAGE_DIR="$prepared_package_dir"
+    ARCHIVE_NAME="$PREPARED_ARCHIVE_NAME"
+    case "$ARCHIVE_NAME" in "${ARCHIVE_PREFIX}"*"${ARCHIVE_SUFFIX}") ;; *)
+        die "预下载包名与系统不匹配。" "The pre-downloaded archive name does not match this system." ;;
+    esac
     has_packages "$PACKAGE_DIR" || die "预下载目录中没有可安装的软件包。" "The pre-downloaded directory has no installable packages."
     validate_package_architecture || \
         die "预下载包中的软件包架构与当前系统不匹配。" "The pre-downloaded package architecture does not match this system."
@@ -916,7 +948,7 @@ install_deb_packages() {
 
     log "正在安装 ${#files[@]} 个 deb 包并自动处理依赖..." \
         "Installing ${#files[@]} deb packages and resolving dependencies..."
-    apt-get install -y --allow-downgrades --allow-change-held-packages "${files[@]}"
+    apt-get install -y --reinstall --allow-downgrades --allow-change-held-packages "${files[@]}"
 
     for file in "${files[@]}"; do
         package="$(dpkg-deb -f "$file" Package)"
@@ -1187,7 +1219,8 @@ configure_dnf_excludes() {
 }
 
 install_rpm_packages() {
-    local -a files packages dnf_install_options=()
+    local -a files packages dnf_install_options=() install_files=() reinstall_files=()
+    local file package_name package_version installed_version
     local dnf_conf="/etc/dnf/dnf.conf"
     local dnf_backup
 
@@ -1195,6 +1228,17 @@ install_rpm_packages() {
     command -v rpm >/dev/null 2>&1 || die "未找到 rpm。" "rpm was not found."
     mapfile -t files < <(find "$PACKAGE_DIR" -maxdepth 1 -type f -name '*.rpm' -print | sort)
     ((${#files[@]} > 0)) || die "没有可安装的 rpm 包。" "No installable rpm packages were found."
+
+    for file in "${files[@]}"; do
+        package_name="$(rpm -qp --queryformat '%{NAME}' "$file")"
+        package_version="$(rpm -qp --queryformat '%{EPOCHNUM}:%{VERSION}-%{RELEASE}' "$file")"
+        installed_version="$(rpm -q --queryformat '%{EPOCHNUM}:%{VERSION}-%{RELEASE}' "$package_name" 2>/dev/null || true)"
+        if [[ "$installed_version" == "$package_version" ]]; then
+            reinstall_files+=("$file")
+        else
+            install_files+=("$file")
+        fi
+    done
 
     log "正在安装 ${#files[@]} 个 rpm 包并自动处理依赖..." \
         "Installing ${#files[@]} rpm packages and resolving dependencies..."
@@ -1208,7 +1252,8 @@ install_rpm_packages() {
         dnf_install_options+=('--exclude=systemd*')
     fi
     if ! remove_managed_dnf_excludes "$dnf_conf" || \
-        ! dnf install -y "${dnf_install_options[@]}" "${files[@]}"; then
+        ! { ((${#install_files[@]} == 0)) || dnf --nogpgcheck install -y "${dnf_install_options[@]}" "${install_files[@]}"; } || \
+        ! { ((${#reinstall_files[@]} == 0)) || dnf --nogpgcheck reinstall -y "${dnf_install_options[@]}" "${reinstall_files[@]}"; }; then
         install -m 0644 "$dnf_backup" "$dnf_conf" || true
         rm -f -- "$dnf_backup"
         die "rpm 软件包安装失败。" "RPM package installation failed."
@@ -1300,6 +1345,10 @@ main() {
         download_packages
     fi
     require_root "$@"
+    if [[ "$PACKAGE_TYPE" == "pkg.tar.*" && -s "$COMPONENT_STATE_DIR/niri.version" ]]; then
+        die "检测到 Anland Niri。Niri 与 KDE 共用 patched xorg-xwayland；为避免覆盖，请先卸载 Anland Niri。" \
+            "Anland Niri is installed. Niri and KDE share patched xorg-xwayland; uninstall Anland Niri first to avoid replacing it."
+    fi
 
     case "$PACKAGE_TYPE" in
         deb) install_deb_packages ;;
